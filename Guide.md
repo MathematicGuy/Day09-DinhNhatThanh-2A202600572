@@ -420,7 +420,7 @@ Bạn nên tự kiểm tra:
 Bạn có thể thêm:
 
 - prompt rõ hơn cho từng worker
-- citation đẹp hơn
+- citation đẹp hơn	
 - summary file cho batch test
 - evaluator đơn giản để check route/status
 - đổi provider mà không phải sửa graph
