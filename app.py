@@ -39,7 +39,9 @@ def main() -> None:
         "Run shopping-support questions through the supervisor-worker graph and inspect routing, worker output, and traces."
     )
 
-    ask_tab, batch_tab, about_tab = st.tabs(["Ask & Trace", "Batch Dashboard", "About"])
+    chat_tab, ask_tab, batch_tab, about_tab = st.tabs(["Live Chat", "Ask & Trace", "Batch Dashboard", "About"])
+    with chat_tab:
+        render_chat_tab()
     with ask_tab:
         render_ask_tab()
     with batch_tab:
@@ -56,6 +58,7 @@ def initialize_state() -> None:
         "batch_recommendations": None,
         "selected_trace": None,
         "selected_case_id": None,
+        "chat_messages": [],
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -75,6 +78,75 @@ def _build_assistant() -> ShoppingAssistant:
 
 def _load_cases() -> list[dict[str, Any]]:
     return json.loads(TEST_FILE.read_text(encoding="utf-8"))
+
+
+def render_chat_tab() -> None:
+    st.write("Chat with the supervisor-worker graph and inspect each turn's trace under the answer.")
+    if st.button("Clear chat", disabled=not st.session_state.chat_messages):
+        st.session_state.chat_messages = []
+        st.rerun()
+
+    prompt = st.chat_input("Ask a shopping-support question...")
+    if prompt and prompt.strip():
+        with st.spinner("Running supervisor-worker graph..."):
+            append_chat_turn(prompt.strip())
+
+    if not st.session_state.chat_messages:
+        st.info("Ask a question to start a traced chat session.")
+        return
+
+    for index, turn in enumerate(st.session_state.chat_messages):
+        render_chat_turn(turn, index)
+
+
+def append_chat_turn(question: str) -> dict[str, Any]:
+    try:
+        result = get_assistant().ask(question)
+    except Exception as exc:
+        result = {
+            "final_answer": f"Status: error\nMessage: {exc}",
+            "route": {"status": "error", "reason": "Graph execution failed."},
+            "policy_result": {},
+            "data_result": {},
+            "trace": [],
+        }
+
+    turn = {
+        "question": question,
+        "answer": result.get("final_answer", ""),
+        "result": result,
+        "trace": result.get("trace", []),
+    }
+    st.session_state.chat_messages.append(turn)
+    return turn
+
+
+def render_chat_turn(turn: dict[str, Any], index: int) -> None:
+    with st.chat_message("user"):
+        st.markdown(turn.get("question", ""))
+
+    result = turn.get("result", {})
+    with st.chat_message("assistant"):
+        answer = turn.get("answer") or result.get("final_answer") or "No answer returned."
+        st.code(answer, language="text")
+        with st.expander("Trace for this response", expanded=True):
+            render_route_summary(result.get("route", {}))
+
+            st.subheader("Worker Results")
+            policy_col, data_col = st.columns(2)
+            with policy_col:
+                render_worker_card("Policy worker", result.get("policy_result", {}))
+            with data_col:
+                render_worker_card("Data worker", result.get("data_result", {}))
+
+            trace = turn.get("trace", [])
+            render_trace_section(trace)
+            render_json_download(
+                "Download response trace JSON",
+                f"chat_response_{index + 1}_trace.json",
+                trace,
+                key=f"chat-trace-{index}",
+            )
 
 
 def render_ask_tab() -> None:
@@ -336,12 +408,13 @@ def format_accuracy(value: Any) -> str:
     return "-"
 
 
-def render_json_download(label: str, filename: str, payload: Any) -> None:
+def render_json_download(label: str, filename: str, payload: Any, key: str | None = None) -> None:
     st.download_button(
         label,
         data=json.dumps(payload, ensure_ascii=False, indent=2),
         file_name=filename,
         mime="application/json",
+        key=key,
     )
 
 
