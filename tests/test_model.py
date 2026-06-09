@@ -11,11 +11,19 @@ import pytest
 import requests
 from dotenv import load_dotenv
 import json
+from openai import OpenAI
+
 
 load_dotenv()
 
 
 def _require_external_smoke(provider_name: str):
+    """
+    This test was intentionally skipped, not failed.
+    Why ? To flexibly skip unwanted function.
+
+    set RUN_EXTERNAL_PROVIDER_SMOKE = 1 in .env to run API test
+    """
     if os.getenv("RUN_EXTERNAL_PROVIDER_SMOKE") != "1":
         pytest.skip(f"Set RUN_EXTERNAL_PROVIDER_SMOKE=1 to run {provider_name} live smoke test.")
 
@@ -56,15 +64,14 @@ def test_openrouter_model_smoke():
     if not api_key:
         pytest.skip("OPENROUTER_API_KEY is not configured")
 
-    from openai import OpenAI
 
     client = OpenAI(
         api_key=api_key,
         base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
     )
     response = client.chat.completions.create(
-        model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
-        messages=[{"role": "user", "content": "Reply with OK only."}],
+        model=os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4-flash"),
+        messages=[{"role": "user", "content": "Reply with I AM OK only."}],
         temperature=0,
     )
     assert response.choices[0].message.content
@@ -77,16 +84,17 @@ def test_openai_model_smoke():
     if not api_key:
         pytest.skip("OPENAI_API_KEY is not configured")
 
-    from openai import OpenAI
+
 
     client = OpenAI(api_key=api_key)
     response = client.chat.completions.create(
         model=os.getenv("OPENAI_MODEL", "gpt-5.4-nano"),
-        messages=[{"role": "user", "content": "Reply with OK only."}],
+        messages=[{"role": "user", "content": "Reply with I AM OK only."}],
         temperature=0,
     )
-    assert response.choices[0].message.content
 
+    print(response.choices[0].message.content)
+    assert response.choices[0].message.content
 
 @pytest.mark.external
 def test_mistral_ocr_client_available():

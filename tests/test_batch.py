@@ -1,8 +1,7 @@
 import json
 from pathlib import Path
-
-from app.config import Settings
-from app.graph import ShoppingAssistant
+from src.app.config import Settings
+from src.app.graph import ShoppingAssistant
 
 
 def test_run_batch_writes_summary_and_traces(tmp_path):

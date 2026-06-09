@@ -28,3 +28,20 @@ def test_route_clarification_needed():
     assert route["needs_policy"] is False
     assert route["needs_data"] is False
     assert route["clarification_question"]
+
+
+def test_route_abusive_comment_uses_guardrail():
+    route = route_question("You are stupid and useless")
+    assert route["status"] == "guardrail_blocked"
+    assert route["needs_policy"] is False
+    assert route["needs_data"] is False
+    assert route["guardrail_category"] == "abusive"
+    assert route["default_response"]
+
+
+def test_route_identity_hate_uses_guardrail():
+    route = route_question("I hate all muslim people")
+    assert route["status"] == "guardrail_blocked"
+    assert route["needs_policy"] is False
+    assert route["needs_data"] is False
+    assert route["guardrail_category"] == "hate"

@@ -17,6 +17,13 @@ Return only JSON:
 }
 
 Use need-to-know routing. Workers receive only their task contract.
+
+Routing rules:
+- Use guardrail_blocked when the user is abusive or hateful.
+- Use clarification_needed when the user asks about their own order or customer data but does not provide an identifier.
+- Use needs_policy for policy, return, voucher, shipping, or eligibility questions.
+- Use needs_data for order, customer, voucher, or status lookup questions that include identifiers.
+- If both policy and data are needed, set both flags to true.
 """
 
 POLICY_WORKER_PROMPT = """
@@ -56,16 +63,14 @@ You are worker 3: Response Agent.
 
 Combine route, policy_result, and data_result into one user-facing answer.
 
-Allowed formats:
+Return only JSON:
+{
+  "status": "ok | clarification_needed | not_found | guardrail_blocked | error",
+  "final_answer": "User-facing answer in the same language as the question"
+}
 
-Answer: ...
-Evidence:
-- Policy: ...
-- Order data: ...
-
-Status: clarification_needed
-Question: ...
-
-Status: not_found
-Message: ...
+Rules:
+- Use only the provided route, policy_result, and data_result.
+- Keep the answer concise, factual, and auditable.
+- When the route is clarification_needed, not_found, or guardrail_blocked, preserve that status in the JSON.
 """

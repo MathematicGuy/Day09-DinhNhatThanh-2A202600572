@@ -7,18 +7,55 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
 from app.config import Settings
 from app.data_access import ShoppingDataStore
+from app.prompts import RESPONSE_WORKER_PROMPT, SUPERVISOR_PROMPT
 from app.state import ShoppingState
 from app.tracing import json_safe, make_trace_event
+from app.utils import extract_json_payload
+from provider import get_chat_model
 from rag.parser import parse_policy_markdown
 
 
 ORDER_RE = re.compile(r"(?:đơn hàng|order)\s*(\d{3,})", re.IGNORECASE)
 ANY_ORDER_ID_RE = re.compile(r"\b\d{4}\b")
 CUSTOMER_RE = re.compile(r"\bC\d{3}\b", re.IGNORECASE)
+ABUSIVE_TERMS = [
+    "stupid",
+    "useless",
+    "idiot",
+    "shut up",
+    "dumb",
+]
+HATE_TARGET_TERMS = [
+    "muslim",
+    "jewish",
+    "black people",
+    "gay people",
+    "women",
+    "immigrants",
+]
+HATE_ACTION_TERMS = [
+    "hate all",
+    "kill all",
+    "ban all",
+    "get rid of",
+]
+GUARDRAIL_DEFAULT_RESPONSES = {
+    "abusive": (
+        "Status: guardrail_blocked\n"
+        "Message: Mình hiểu bạn có thể đang bực, nhưng mình vẫn sẵn sàng hỗ trợ "
+        "nếu bạn gửi câu hỏi về đơn hàng, voucher, giao hàng hoặc chính sách mua sắm."
+    ),
+    "hate": (
+        "Status: guardrail_blocked\n"
+        "Message: Mình không thể hỗ trợ nội dung công kích nhóm người. "
+        "Mình vẫn có thể giúp với câu hỏi về đơn hàng, voucher, giao hàng hoặc chính sách mua sắm."
+    ),
+}
 
 
 class ShoppingAssistant:
@@ -28,6 +65,8 @@ class ShoppingAssistant:
         self.settings = settings or Settings.load()
         self.data_store = ShoppingDataStore(self.settings.orders_path)
         self.policy_chunks: list[dict[str, Any]] | None = None
+        self.response_model: Any | None = None
+        self.response_model_error: str | None = None
         self.graph = build_graph(self)
 
     def ask(
@@ -163,16 +202,31 @@ class ShoppingAssistant:
             )
         return hits
 
+    def get_response_model(self) -> Any | None:
+        if self.response_model is not None or self.response_model_error is not None:
+            return self.response_model
+
+        if self.settings.provider != "openai":
+            self.response_model_error = "OpenAI response model is disabled for the current provider."
+            return None
+
+        try:
+            self.response_model = get_chat_model(self.settings)
+        except Exception as exc:
+            self.response_model = None
+            self.response_model_error = str(exc)
+        return self.response_model
+
 
 def build_graph(assistant: ShoppingAssistant | None = None) -> Any:
     if assistant is None:
         assistant = ShoppingAssistant()
 
     graph = StateGraph(ShoppingState)
-    graph.add_node("supervisor", lambda state: supervisor_node(state))
+    graph.add_node("supervisor", lambda state: supervisor_node(state, assistant))
     graph.add_node("worker_1_policy", lambda state: worker_1_policy_node(state, assistant))
     graph.add_node("worker_2_data", lambda state: worker_2_data_node(state, assistant))
-    graph.add_node("worker_3_response", lambda state: worker_3_response_node(state))
+    graph.add_node("worker_3_response", lambda state: worker_3_response_node(state, assistant))
 
     graph.set_entry_point("supervisor")
     graph.add_conditional_edges(
@@ -194,9 +248,12 @@ def build_graph(assistant: ShoppingAssistant | None = None) -> Any:
     return graph.compile()
 
 
-def supervisor_node(state: ShoppingState) -> ShoppingState:
+def supervisor_node(
+    state: ShoppingState,
+    assistant: ShoppingAssistant | None = None,
+) -> ShoppingState:
     started = time.perf_counter()
-    route = route_question(state["question"])
+    route, route_source, route_model_name, warnings = supervisor_decide(state["question"], assistant)
     trace = make_trace_event(
         run_id=state["run_id"],
         case_id=state.get("case_id"),
@@ -204,7 +261,8 @@ def supervisor_node(state: ShoppingState) -> ShoppingState:
         event="route_decided",
         status=route["status"],
         input_payload={"question": state["question"]},
-        output_payload=route,
+        output_payload={**route, "route_source": route_source, "route_model": route_model_name},
+        warnings=warnings,
         latency_ms=_latency_ms(started),
     )
     return {"route": route, "trace": [trace]}
@@ -357,30 +415,38 @@ def worker_2_data_node(
     return {"data_result": result, "trace": [trace]}
 
 
-def worker_3_response_node(state: ShoppingState) -> ShoppingState:
+def worker_3_response_node(
+    state: ShoppingState,
+    assistant: ShoppingAssistant | None = None,
+) -> ShoppingState:
     started = time.perf_counter()
     route = state.get("route", {})
     policy_result = state.get("policy_result", {})
     data_result = state.get("data_result", {})
+    warnings: list[str] = []
+    response_source = "rules"
+    response_model_name: str | None = None
 
-    if route.get("status") == "clarification_needed":
-        final_answer = (
-            "Status: clarification_needed\n"
-            f"Question: {route.get('clarification_question', 'Vui lòng cung cấp thêm định danh cần tra cứu.')}"
-        )
-        status = "clarification_needed"
-    elif data_result.get("status") == "not_found":
-        final_answer = f"Status: not_found\nMessage: {data_result.get('summary', 'Không tìm thấy dữ liệu phù hợp.')}"
-        status = "not_found"
-    elif policy_result.get("status") == "not_found":
-        final_answer = f"Status: not_found\nMessage: {policy_result.get('summary', 'Không tìm thấy policy phù hợp.')}"
-        status = "not_found"
-    elif data_result.get("status") == "error" and policy_result.get("status") == "error":
-        final_answer = "Status: error\nMessage: Cả policy worker và data worker đều thất bại."
-        status = "error"
+    if route.get("status") == "guardrail_blocked":
+        final_answer = route.get("default_response") or GUARDRAIL_DEFAULT_RESPONSES["abusive"]
+        status = "guardrail_blocked"
     else:
-        final_answer = _compose_success_answer(state["question"], policy_result, data_result)
-        status = "ok"
+        fallback_answer, fallback_status = _compose_fallback_response(
+            route,
+            state["question"],
+            policy_result,
+            data_result,
+        )
+        final_answer, status, response_source, response_model_name = _generate_model_answer(
+            assistant,
+            state["question"],
+            route,
+            policy_result,
+            data_result,
+            warnings,
+            fallback_answer,
+            fallback_status,
+        )
 
     output = {"final_answer": final_answer}
     trace = make_trace_event(
@@ -390,14 +456,148 @@ def worker_3_response_node(state: ShoppingState) -> ShoppingState:
         event="answer_synthesized",
         status=status,
         input_payload={"route": route, "policy_result": policy_result, "data_result": data_result},
-        output_payload=output,
+        output_payload={**output, "response_source": response_source, "response_model": response_model_name},
+        warnings=warnings,
         latency_ms=_latency_ms(started),
     )
     return {"final_answer": final_answer, "trace": [trace]}
 
 
+def _generate_model_answer(
+    assistant: ShoppingAssistant | None,
+    question: str,
+    route: dict[str, Any],
+    policy_result: dict[str, Any],
+    data_result: dict[str, Any],
+    warnings: list[str],
+    fallback_answer: str,
+    fallback_status: str,
+) -> tuple[str, str, str, str | None]:
+    if assistant is None:
+        return fallback_answer, fallback_status, "rules", None
+
+    model = assistant.get_response_model()
+    if model is None:
+        if assistant.response_model_error:
+            warnings.append(assistant.response_model_error)
+        return fallback_answer, fallback_status, "rules", None
+
+    response_model_name = getattr(model, "model_name", None) or getattr(model, "model", None)
+    payload = {
+        "question": question,
+        "route": route,
+        "policy_result": policy_result,
+        "data_result": data_result,
+    }
+
+    try:
+        response = model.invoke(
+            [
+                SystemMessage(content=RESPONSE_WORKER_PROMPT.strip()),
+                HumanMessage(content=json.dumps(payload, ensure_ascii=False, indent=2)),
+            ]
+        )
+        content = str(getattr(response, "content", response)).strip()
+        parsed = extract_json_payload(content)
+        if isinstance(parsed, dict):
+            final_answer = str(parsed.get("final_answer", "")).strip()
+            status = str(parsed.get("status", "ok"))
+            if final_answer:
+                return final_answer, status, "openai", response_model_name
+        if content:
+            return content, fallback_status, "openai", response_model_name
+    except Exception as exc:
+        warnings.append(f"OpenAI response generation failed: {exc}")
+
+    return fallback_answer, fallback_status, "rules", response_model_name
+
+
+def _compose_fallback_response(
+    route: dict[str, Any],
+    question: str,
+    policy_result: dict[str, Any],
+    data_result: dict[str, Any],
+) -> tuple[str, str]:
+    if route.get("status") == "clarification_needed":
+        return (
+            "Status: clarification_needed\n"
+            f"Question: {route.get('clarification_question', 'Vui lòng cung cấp thêm định danh cần tra cứu.')}",
+            "clarification_needed",
+        )
+    if data_result.get("status") == "not_found":
+        return f"Status: not_found\nMessage: {data_result.get('summary', 'Không tìm thấy dữ liệu phù hợp.')}", "not_found"
+    if policy_result.get("status") == "not_found":
+        return f"Status: not_found\nMessage: {policy_result.get('summary', 'Không tìm thấy policy phù hợp.')}", "not_found"
+    if data_result.get("status") == "error" and policy_result.get("status") == "error":
+        return "Status: error\nMessage: Cả policy worker và data worker đều thất bại.", "error"
+    return _compose_success_answer(question, policy_result, data_result), "ok"
+
+
+def supervisor_decide(
+    question: str,
+    assistant: ShoppingAssistant | None = None,
+) -> tuple[dict[str, Any], str, str | None, list[str]]:
+    warnings: list[str] = []
+    deterministic_route = _deterministic_route_question(question)
+    if deterministic_route.get("status") == "guardrail_blocked":
+        return deterministic_route, "rules", None, warnings
+
+    if assistant is None:
+        return deterministic_route, "rules", None, warnings
+
+    model = assistant.get_response_model()
+    if model is None:
+        if assistant.response_model_error:
+            warnings.append(assistant.response_model_error)
+        return deterministic_route, "rules", None, warnings
+
+    response_model_name = getattr(model, "model_name", None) or getattr(model, "model", None)
+    payload = {
+        "question": question,
+        "hint": deterministic_route,
+    }
+
+    try:
+        response = model.invoke(
+            [
+                SystemMessage(content=SUPERVISOR_PROMPT.strip()),
+                HumanMessage(content=json.dumps(payload, ensure_ascii=False, indent=2)),
+            ]
+        )
+        content = str(getattr(response, "content", response)).strip()
+        parsed = extract_json_payload(content)
+        if isinstance(parsed, dict):
+            route = _normalize_route_decision(parsed, question)
+            if route is not None:
+                return route, "openai", response_model_name, warnings
+        if content:
+            warnings.append("Supervisor model returned unstructured content; using deterministic routing.")
+    except Exception as exc:
+        warnings.append(f"OpenAI supervisor routing failed: {exc}")
+
+    return deterministic_route, "rules", response_model_name, warnings
+
+
 def route_question(question: str) -> dict[str, Any]:
+    return supervisor_decide(question)[0]
+
+
+def _deterministic_route_question(question: str) -> dict[str, Any]:
     normalized = _normalize(question)
+    guardrail = classify_guardrail(question)
+    if guardrail is not None:
+        return {
+            "status": "guardrail_blocked",
+            "needs_policy": False,
+            "needs_data": False,
+            "reason": "Guardrail matched hostile input; workers skipped to save tokens.",
+            "clarification_question": None,
+            "guardrail_category": guardrail,
+            "default_response": GUARDRAIL_DEFAULT_RESPONSES[guardrail],
+            "policy_task": None,
+            "data_task": None,
+        }
+
     order_ids = extract_order_ids(question)
     customer_ids = extract_customer_ids(question)
     mentions_self = "cua toi" in normalized or "của tôi" in question.lower()
@@ -410,6 +610,8 @@ def route_question(question: str) -> dict[str, Any]:
             "needs_data": False,
             "reason": "Question needs personal data but has no order_id or customer_id.",
             "clarification_question": f"Vui lòng cung cấp {subject} hoặc customer_id để mình kiểm tra chính xác.",
+            "guardrail_category": None,
+            "default_response": None,
             "policy_task": None,
             "data_task": None,
         }
@@ -457,6 +659,8 @@ def route_question(question: str) -> dict[str, Any]:
         "needs_data": needs_data,
         "reason": _route_reason(needs_policy, needs_data, order_ids, customer_ids),
         "clarification_question": None,
+        "guardrail_category": None,
+        "default_response": None,
         "policy_task": {
             "task": "retrieve policy evidence",
             "context": question,
@@ -472,6 +676,45 @@ def route_question(question: str) -> dict[str, Any]:
         if needs_data
         else None,
     }
+
+
+def _normalize_route_decision(route: dict[str, Any], question: str) -> dict[str, Any] | None:
+    status = str(route.get("status", "")).strip()
+    if status not in {"ok", "clarification_needed"}:
+        return None
+
+    needs_policy = bool(route.get("needs_policy"))
+    needs_data = bool(route.get("needs_data"))
+    guardrail_category = route.get("guardrail_category")
+    default_response = route.get("default_response")
+    clarification_question = route.get("clarification_question")
+    reason = str(route.get("reason", "")).strip() or _route_reason(needs_policy, needs_data, extract_order_ids(question), extract_customer_ids(question))
+
+    normalized_route: dict[str, Any] = {
+        "status": status,
+        "needs_policy": needs_policy,
+        "needs_data": needs_data,
+        "reason": reason,
+        "clarification_question": clarification_question if status == "clarification_needed" else None,
+        "guardrail_category": guardrail_category,
+        "default_response": default_response,
+        "policy_task": route.get("policy_task") if needs_policy else None,
+        "data_task": route.get("data_task") if needs_data else None,
+    }
+
+    if status == "clarification_needed" and not normalized_route["clarification_question"]:
+        normalized_route["clarification_question"] = "Vui lòng cung cấp thêm định danh cần tra cứu."
+
+    if status == "ok" and not (needs_policy or needs_data):
+        normalized_route["needs_policy"] = True
+        normalized_route["policy_task"] = {
+            "task": "retrieve policy evidence",
+            "context": question,
+            "expected_output": "top policy facts with citations",
+        }
+        normalized_route["reason"] = _route_reason(True, False, extract_order_ids(question), extract_customer_ids(question))
+
+    return normalized_route
 
 
 def extract_order_ids(question: str) -> list[str]:
@@ -500,6 +743,8 @@ def result_status(result: dict[str, Any]) -> str:
     route = result.get("route", {})
     data_result = result.get("data_result", {})
     policy_result = result.get("policy_result", {})
+    if route.get("status") == "guardrail_blocked":
+        return "guardrail_blocked"
     if route.get("status") == "clarification_needed":
         return "clarification_needed"
     if data_result.get("status") == "not_found" or policy_result.get("status") == "not_found":
@@ -572,7 +817,7 @@ def recommend_improvements(summary: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _after_supervisor(state: ShoppingState) -> str:
     route = state.get("route", {})
-    if route.get("status") == "clarification_needed":
+    if route.get("status") in {"clarification_needed", "guardrail_blocked"}:
         return "response"
     if route.get("needs_policy"):
         return "policy"
@@ -685,6 +930,17 @@ def _normalize(text: str) -> str:
     }
     lowered = text.lower()
     return "".join(replacements.get(char, char) for char in lowered)
+
+
+def classify_guardrail(question: str) -> str | None:
+    normalized = _normalize(question)
+    if any(action in normalized for action in HATE_ACTION_TERMS) and any(
+        target in normalized for target in HATE_TARGET_TERMS
+    ):
+        return "hate"
+    if any(term in normalized for term in ABUSIVE_TERMS):
+        return "abusive"
+    return None
 
 
 def _policy_terms(query: str) -> list[str]:

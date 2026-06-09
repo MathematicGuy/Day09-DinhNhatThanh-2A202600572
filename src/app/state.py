@@ -5,7 +5,7 @@ import operator
 from typing_extensions import TypedDict
 
 
-Status = Literal["ok", "clarification_needed", "not_found", "error"]
+Status = Literal["ok", "clarification_needed", "not_found", "error", "guardrail_blocked"]
 
 
 class WorkerTask(TypedDict, total=False):
@@ -20,6 +20,8 @@ class RouteDecision(TypedDict, total=False):
     needs_data: bool
     reason: str
     clarification_question: str | None
+    guardrail_category: str | None
+    default_response: str | None
     policy_task: WorkerTask | None
     data_task: WorkerTask | None
 

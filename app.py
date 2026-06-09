@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import html
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,9 @@ from app.graph import ShoppingAssistant, recommend_improvements  # noqa: E402
 
 
 TEST_FILE = ROOT_DIR / "data" / "test.json"
+REPORT_FILE = ROOT_DIR / "docs" / "supervisor_worker_agent_report.md"
 OUTPUT_DIR = ROOT_DIR / "src" / "artifacts" / "streamlit_demo"
+STREAMLIT_SUPERVISOR_MODEL = "gpt-5.4-nano"
 st: Any = None
 
 
@@ -24,6 +28,7 @@ def main() -> None:
     global get_assistant, load_cases, st
     import streamlit as streamlit
 
+    configure_streamlit_supervisor_model()
     st = streamlit
     get_assistant = st.cache_resource(_build_assistant)
     load_cases = st.cache_data(_load_cases)
@@ -80,8 +85,17 @@ def _load_cases() -> list[dict[str, Any]]:
     return json.loads(TEST_FILE.read_text(encoding="utf-8"))
 
 
+def configure_streamlit_supervisor_model() -> None:
+    os.environ.setdefault("LLM_PROVIDER", "openai")
+    os.environ.setdefault("LLM_MODEL", STREAMLIT_SUPERVISOR_MODEL)
+
+
 def render_chat_tab() -> None:
     st.write("Chat with the supervisor-worker graph and inspect each turn's trace under the answer.")
+    st.caption(
+        f"Supervisor model default: `{os.getenv('LLM_MODEL', STREAMLIT_SUPERVISOR_MODEL)}`. "
+        "Guardrail fallback skips policy/data workers for abusive or hateful comments."
+    )
     if st.button("Clear chat", disabled=not st.session_state.chat_messages):
         st.session_state.chat_messages = []
         st.rerun()
@@ -388,11 +402,62 @@ def render_trace_section(trace: list[dict[str, Any]]) -> None:
 def render_about_tab() -> None:
     st.subheader("Flow")
     st.code("User -> Supervisor -> Policy worker and/or Data worker -> Response worker", language="text")
+    flowchart = load_report_flowchart(REPORT_FILE)
+    if flowchart:
+        st.subheader("Supervisor-Worker Flowchart")
+        render_mermaid_flowchart(flowchart)
+        with st.expander("Mermaid source", expanded=False):
+            st.code(flowchart, language="mermaid")
+    else:
+        st.warning(f"No Mermaid flowchart found in `{REPORT_FILE.relative_to(ROOT_DIR)}`.")
     st.write(
         "The demo uses the current synchronous graph and JSON trace events. "
         "It is intended for local classroom inspection of routing, worker outputs, and batch quality signals."
     )
     st.write("No LangGraph Studio integration or graph behavior changes are included.")
+
+
+def load_report_flowchart(path: Path = REPORT_FILE) -> str:
+    if not path.exists():
+        return ""
+    markdown = path.read_text(encoding="utf-8")
+    start_marker = "```mermaid"
+    start = markdown.find(start_marker)
+    if start == -1:
+        return ""
+    block_start = markdown.find("\n", start)
+    if block_start == -1:
+        return ""
+    block_end = markdown.find("```", block_start + 1)
+    if block_end == -1:
+        return ""
+    return markdown[block_start + 1 : block_end].strip()
+
+
+def render_mermaid_flowchart(source: str) -> None:
+    import streamlit.components.v1 as components
+
+    escaped_source = html.escape(source)
+    components.html(
+        f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <script type="module">
+                import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+                mermaid.initialize({{ startOnLoad: true, securityLevel: 'strict' }});
+            </script>
+        </head>
+        <body>
+            <pre class="mermaid">
+{escaped_source}
+            </pre>
+        </body>
+        </html>
+        """,
+        height=900,
+        scrolling=True,
+    )
 
 
 def group_trace_by_node(trace: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
